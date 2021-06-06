@@ -1,4 +1,10 @@
 
+"""
+A graph neural network based model to predict order parameter.
+
+The architecture and performance of this model is described in our publication:
+"Learning Self-Driven Collective Dynamics with Graph Networks".
+"""
 
 from __future__ import absolute_import
 from __future__ import division
@@ -21,6 +27,20 @@ def make_graph_from_static_structure(
     types,
     box,
     edge_threshold):
+  """
+  Returns graph representing the structure of the collective.
+
+  Each particle is represented by a node in the graph. The particle motion direction is  stored as a node feature.
+  Two particles at a distance less than the threshold are connected by an edge.
+  The relative distance vector is stored as an edge feature.
+
+  Args:
+    positions: particle positions with shape [n_particles, 2].
+    types: particle motion direction with shape [n_particles].
+    box: dimensions of the box that contains the particles with shape [2].
+    edge_threshold: particles at distance less than threshold are connected by a
+  """
+  # Calculate pairwise relative distances between particles
   cross_positions = positions[tf.newaxis, :, :] - positions[:, tf.newaxis, :]
   # Enforces periodic boundary conditions.
   box_ = box[tf.newaxis, tf.newaxis, :]
@@ -50,7 +70,17 @@ def make_graph_from_static_structure(
 
 
 def apply_random_rotation(graph):
+  """Returns randomly rotated graph representation.
 
+  The rotation is an element of O(3) with rotation angles multiple of pi/2.
+  This function assumes that the relative particle distances are stored in
+  the edge features.
+
+  Args:
+    graph: The graphs tuple as defined in `graph_nets.graphs`.
+  """
+  # Transposes edge features, so that the axes are in the first dimension.
+  # Outputs a tensor of shape [2, n_particles].
   xyz = tf.transpose(graph.edges)
   # Random pi/2 rotation(s)
   permutation = tf.random.shuffle(tf.constant([0, 1], dtype=tf.int32))
@@ -64,14 +94,29 @@ def apply_random_rotation(graph):
 
 
 class GraphBasedModel(snt.AbstractModule):
+  """Graph based model which predicts order parameter from their positions.
 
+  This network encodes the nodes and edges of the input graph independently, and
+  then performs message-passing on this graph, updating its edges based on their
+  associated nodes, then updating the nodes based on the input nodes' features
+  and their associated updated edge features.
+  This update is repeated several times.
+  Afterwards the resulting global embeddings are decoded to predict the order parameter.
+  """
 
   def __init__(self,
                n_recurrences,
                mlp_sizes,
                mlp_kwargs = None,
                name='Graph'):
+    """Creates a new GraphBasedModel object.
 
+    Args:
+      n_recurrences: the number of message passing steps in the graph network.
+      mlp_sizes: the number of neurons in each layer of the MLP.
+      mlp_kwargs: additional keyword aguments passed to the MLP.
+      name: the name of the Sonnet module.
+    """
     super(GraphBasedModel, self).__init__(name=name)
     self._n_recurrences = n_recurrences
 
@@ -100,6 +145,7 @@ class GraphBasedModel(snt.AbstractModule):
         self._propagation_network = gn_modules.GraphNetwork(
             node_model_fn=model_fn,
             edge_model_fn=model_fn,
+
             global_model_fn=model_fn,
             reducer=tf.unsorted_segment_sum)
       self._decoder = gn_modules.GraphIndependent(

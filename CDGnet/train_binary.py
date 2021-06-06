@@ -1,5 +1,7 @@
 
 
+"""Trains a graph-based network to predict order parameter in self-driven collective."""
+
 from __future__ import absolute_import
 from __future__ import division
 

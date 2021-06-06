@@ -1,5 +1,7 @@
 
 
+"""Training pipeline for the prediction of order parameter in self-driven collective."""
+
 from __future__ import absolute_import
 from __future__ import division
 
@@ -27,13 +29,25 @@ GlassSimulationData = collections.namedtuple('GlassSimulationData',
                                              'positions, targets, types, box')
 
 
+
+
 def get_targets(
         initial_positions,
         trajectory_target_positions):
+    """Returns the averaged order parameter from the sampled trajectories.
 
+    Args:
+      initial_positions: the initial positions of the particles with shape
+        [n_particles, 2].
+
+      trajectory_target_positions: the absolute positions of the particles at the
+        target time for all sampled trajectories, each with shape
+        [n_particles, 2].
+
+    """
     targets = np.mean([np.linalg.norm(t - initial_positions, axis=-1)
                        for t in trajectory_target_positions], axis=0)
-
+    # 对于trajectory_target_positions中的30中不同速度的目标位置遍历，相减之后计算二范数
     return targets.astype(np.float32)
 
 
@@ -42,6 +56,21 @@ def load_data(
         time_index,
         max_files_to_load=None):
     """Returns a dictionary containing the training or test dataset.
+       加载数据集
+    The dictionary contains:
+      `positions`: `np.ndarray` containing the particle positions with shape
+        [n_particles, 2].
+
+      `targets`: `np.ndarray` containing order parameter with shape
+        [n_particles].
+
+      `types`: `np.ndarray` containing the particle motion direction with shape with shape
+        [n_particles].
+
+      `box`: `np.ndarray` containing the dimensions of the periodic box with shape
+        [2].
+
+  
     Args:
       file_pattern: pattern matching the files with the simulation data.
       time_index: the time index of the targets.
@@ -70,14 +99,31 @@ def load_data(
 
 def get_loss_ops(
         prediction,
-        target):
+        target,
+        types):
+    """Returns L1/L2 loss and correlation.
+
+  
+    Args:
+      prediction: tensor with shape [n_particles] containing the predicted
+        order parameter.
+      target: tensor with shape [n_particles] containing the true order parameter.
+      types: tensor with shape [n_particles] containing the particle motion direction.
+    """
+
     return LossCollection(l1_loss=tf.reduce_mean(tf.abs(prediction - target)),l2_loss=tf.reduce_mean((prediction - target)**2))
 
 def get_minimize_op(
         loss,
         learning_rate,
         grad_clip=None):
+    """Returns minimization operation.
 
+    Args:
+      loss: the loss tensor which is minimized.
+      learning_rate: the learning rate used by the optimizer.
+      grad_clip: all gradients are clipped to the given value if not None or 0.
+    """
     optimizer = tf.train.AdamOptimizer(learning_rate)
     grads_and_vars = optimizer.compute_gradients(loss)
     
@@ -92,7 +138,16 @@ def get_minimize_op(
 def _log_stats_and_return_mean_correlation(
         label,
         stats):
+    """Logs performance statistics and returns mean correlation.
+  
+    Args:
+      label: label printed before the combined statistics e.g. train or test.
+      stats: statistics calculated for each batch in a dataset.
 
+  
+    Returns:
+      mean correlation
+    """
     for key in LossCollection._fields:
         values = [getattr(s, key) for s in stats]
         mean = np.mean(values)
@@ -115,7 +170,34 @@ def train_model(train_file_pattern,
                 edge_threshold=1,
                 measurement_store_interval=1000,
                 checkpoint_path=None):
+    """Trains GraphModel using tensorflow.
+  
+    Args:
+      train_file_pattern: pattern matching the files with the training data.
+      test_file_pattern: pattern matching the files with the test data.
+      max_files_to_load: the maximum number of train and test files to load.
+        If None, all files will be loaded.
+      n_epochs: the number of passes through the training dataset (epochs).
+      time_index: the time index of the target mobilities.
+      augment_data_using_rotations: data is augemented by using random rotations.
+      learning_rate: the learning rate used by the optimizer.
+      grad_clip: all gradients are clipped to the given value.
+      n_recurrences: the number of message passing steps in the graphnet.
 
+      mlp_sizes: the number of neurons in each layer of the MLP.
+      mlp_kwargs: additional keyword aguments passed to the MLP.
+
+      edge_threshold: particles at distance less than threshold are connected by
+        an edge.
+      measurement_store_interval: number of steps between storing objective values
+
+        (loss and correlation).
+      checkpoint_path: path used to store the checkpoint with the highest
+        correlation on the test set.
+  
+    Returns:
+      Correlation on the test dataset of best model encountered during training.
+    """
     if mlp_kwargs is None:
         mlp_kwargs = dict(initializers=dict(w=tf.variance_scaling_initializer(1.0),
                                             b=tf.variance_scaling_initializer(0.1)))
@@ -142,7 +224,12 @@ def train_model(train_file_pattern,
         """Applies random rotations to the graph and forwards targets and types."""
         return graph_model.apply_random_rotation(graph), targets, types
 
-
+    # Defines data-pipeline based on tf.data.Dataset following the official
+    # guideline: https://www.tensorflow.org/guide/datasets#consuming_numpy_arrays.
+    # We use initializable iterators to avoid embedding the training and test data
+    # directly into the graph.
+    # Instead we feed the data to the iterators during the initalization of the
+    # iterators before the main training loop.
     placeholders = GlassSimulationData._make(
         tf.placeholder(s.dtype, (None,) + s.shape) for s in training_data[0])
     dataset = tf.data.Dataset.from_tensor_slices(placeholders)
@@ -161,7 +248,10 @@ def train_model(train_file_pattern,
     dataset = dataset.repeat()
     test_iterator = dataset.make_initializable_iterator()
 
-
+    # Creates tensorflow graph.
+    # Note: We decouple the training and test datasets from the input pipeline
+    # by creating a new iterator from a string-handle placeholder with the same
+    # output types and shapes as the training dataset.
     dataset_handle = tf.placeholder(tf.string, shape=[])
     iterator = tf.data.Iterator.from_string_handle(
         dataset_handle, train_iterator.output_types, train_iterator.output_shapes)
@@ -171,10 +261,6 @@ def train_model(train_file_pattern,
     model = graph_model.GraphBasedModel(
         n_recurrences, mlp_sizes, mlp_kwargs)
     prediction = model(graph)
-    print('prediction')
-    print(prediction)
-    print('targets')
-    print(targets)
     # Defines loss and minimization operations.
     loss_ops = get_loss_ops(prediction, targets, types)
     print('loss')
@@ -188,6 +274,9 @@ def train_model(train_file_pattern,
     saver = tf.train.Saver()
 
     with tf.train.SingularMonitoredSession() as session:
+        # Initializes train and test iterators with the training and test datasets.
+        # The obtained training and test string-handles can be passed to the
+        # dataset_handle placeholder to select the dataset.
         train_handle = session.run(train_iterator.string_handle())
         test_handle = session.run(test_iterator.string_handle())
         feed_dict = {p: [x[i] for x in training_data]
@@ -237,7 +326,7 @@ def apply_model(checkpoint_path,
       file_pattern: pattern matching the files with the data.
       max_files_to_load: the maximum number of files to load.
         If None, all files will be loaded.
-      time_index: the time index (0-9) of the target mobilities.
+      time_index: the time index  of the target mobilities.
   
     Returns:
       Predictions of the model for all files.
